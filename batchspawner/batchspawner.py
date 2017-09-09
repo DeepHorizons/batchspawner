@@ -31,6 +31,10 @@ from traitlets import (
 
 from jupyterhub.utils import random_port
 from jupyterhub.spawner import set_user_setuid
+import paramiko
+import random
+import string
+import logging
 
 
 class BatchSpawnerBase(Spawner):
@@ -626,3 +630,74 @@ class LsfSpawner(BatchSpawnerBase):
         return
 
 # vim: set ai expandtab softtabstop=4:
+
+
+class RITSpawner(SlurmSpawner):
+    def cmd_formatted_for_batch(self):
+        # Since < 0.8 does not have a connect_ip variable, we need to inject it
+        args = self.get_args()
+        hub_api_index = [i for i, s in enumerate(args) if '--hub-api-url' in s][0]
+        args[hub_api_index] = '--hub-api-url="http://jupyterhub.main.ad.rit.edu/hub/api"'  # TODO XXX This should not have to be here
+        return ' '.join(self.cmd + args)
+
+    def user_env(self, env):
+        """get user environment"""
+        # pwd.getpwnnam fails because there are no local users
+        env['USER'] = self.user.name
+        home = "/home/{username}".format(username=self.user.name)
+        shell = "bash"
+        if home:
+            env['HOME'] = home
+        if shell:
+            env['SHELL'] = shell
+        return env
+
+    @default('req_homedir')
+    def server_homedir(self):
+        # pwd.getpwnnam fails because there are no local users
+        return "/home/{username}".format(username=self.user.name)
+
+    @gen.coroutine
+    def run_command(self, cmd, input=None, env=None):
+        SSH_USERNAME = os.environ.get('SSH_USERNAME')
+        SSH_SERVER = os.environ.get('SSH_SERVER')
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(SSH_SERVER, username=SSH_USERNAME)
+        # stdin write wasnt working, this seems to
+        if input:
+            cmd = """{cmd} << EOF
+{input}
+EOF""".format(cmd=cmd, input=input)
+        # Can't set arbitrary env variables, need to source them from a file
+        if env:
+            source_file = '\n'.join("export {key}={value}".format(key=key, value=value) for key, value in env.items())
+            # Make a unique name so we don't have collisions
+            filename = '.jupyter_source_env_' + ''.join(random.choice(string.ascii_letters) for i in range(10))
+            logging.warning("Making env file: {}\n{env}".format(filename, env=source_file))
+            stdin, stdout, stderr = client.exec_command('printf "{source_file}" > {filename}'.format(source_file=source_file, filename=filename))
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status != 0:
+                logging.critical("Error creating env file\nout: {out}\nerr: {err}".format(out=stdout.read().decode(), err=stderr.read().decode()))
+                raise Exception("Failed to create env file")
+            cmd = "source {filename};".format(filename=filename) + cmd
+
+        stdin, stdout, stderr = client.exec_command(cmd)
+
+        # TODO read() blocks, figure out coroutines with paramiko
+        out = stdout.read()
+        err_output = stderr.read()
+        err = stdout.channel.recv_exit_status()
+
+        if env:
+            # Remove the source file
+            client.exec_command("rm {filename}".format(filename=filename))
+
+        client.close()
+        if err != 0:
+            print("OH JESUS THERE WAS AN ERROR: {}".format(err_output))
+            return str(err) # exit error?
+        else:
+            out = out.decode().strip()
+            return str(out)
